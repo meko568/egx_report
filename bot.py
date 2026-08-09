@@ -1,27 +1,24 @@
 #!/usr/bin/env python3
 """
-EGX Halal Report — Telegram bot (webhook mode, for PythonAnywhere free tier)
+EGX Halal Report — Telegram bot (webhook mode, PythonAnywhere free tier, SQLite)
 
 Env vars required:
   TELEGRAM_BOT_TOKEN   - from @BotFather
   ADMIN_TELEGRAM_ID    - your telegram numeric id (get from @userinfobot)
   WEBHOOK_SECRET       - random string, part of the webhook URL path
   WEBHOOK_DOMAIN       - e.g. https://yourname.pythonanywhere.com
-  DB_HOST              - e.g. yourname.mysql.pythonanywhere-services.com
-  DB_USER              - e.g. yourname
-  DB_PASS
-  DB_NAME              - e.g. yourname$egxbot
+  DB_PATH              - e.g. /home/yourname/egx_report/egxbot.db
   CRON_SECRET          - random string, protects /run-daily-report endpoint
   VODAFONE_CASH_NUMBER - number shown to users on /subscribe
 """
 
 import os
+import sqlite3
 import logging
 from datetime import date, timedelta
 
 from flask import Flask, request
 import requests
-import pymysql
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("egx_bot")
@@ -30,22 +27,19 @@ BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ADMIN_ID = int(os.environ["ADMIN_TELEGRAM_ID"])
 API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 VODAFONE_CASH_NUMBER = os.environ.get("VODAFONE_CASH_NUMBER", "01xxxxxxxxx")
+DB_PATH = os.environ.get("DB_PATH", os.path.join(os.path.dirname(__file__), "egxbot.db"))
 SUB_PRICE_EGP = 100
 SUB_DAYS = 30
-TRIAL_TICKER_CAP = 12  # keep trial report light
+TRIAL_TICKER_CAP = 12
 
 app = Flask(__name__)
 
 
 def db():
-    return pymysql.connect(
-        host=os.environ.get("DB_HOST", "localhost"),
-        user=os.environ["DB_USER"],
-        password=os.environ["DB_PASS"],
-        database=os.environ["DB_NAME"],
-        autocommit=True,
-        cursorclass=pymysql.cursors.DictCursor,
-    )
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
 
 
 def send_message(chat_id, text, parse_mode="Markdown"):
@@ -79,40 +73,35 @@ def forward_photo(file_id, from_user):
 def get_or_create_user(tg_id, username):
     conn = db()
     try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM users WHERE telegram_id=%s", (tg_id,))
-            user = cur.fetchone()
-            if not user:
-                cur.execute(
-                    "INSERT INTO users (telegram_id, username, subscribed, trial_used) "
-                    "VALUES (%s,%s,FALSE,FALSE)",
-                    (tg_id, username),
+        row = conn.execute("SELECT * FROM users WHERE telegram_id=?", (tg_id,)).fetchone()
+        if not row:
+            conn.execute(
+                "INSERT INTO users (telegram_id, username, subscribed, trial_used) VALUES (?,?,0,0)",
+                (tg_id, username),
+            )
+            tickers = [r["ticker"] for r in conn.execute("SELECT ticker FROM halal_stocks").fetchall()]
+            for t in tickers:
+                conn.execute(
+                    "INSERT OR IGNORE INTO watchlist (telegram_id, ticker) VALUES (?,?)", (tg_id, t)
                 )
-                cur.execute("SELECT ticker FROM halal_stocks")
-                for row in cur.fetchall():
-                    cur.execute(
-                        "INSERT IGNORE INTO watchlist (telegram_id, ticker) VALUES (%s,%s)",
-                        (tg_id, row["ticker"]),
-                    )
-                cur.execute("SELECT * FROM users WHERE telegram_id=%s", (tg_id,))
-                user = cur.fetchone()
-        return user
+            conn.commit()
+            row = conn.execute("SELECT * FROM users WHERE telegram_id=?", (tg_id,)).fetchone()
+        return row
     finally:
         conn.close()
 
 
 def is_subscribed(user):
-    return bool(user["subscribed"]) and user["expiry"] and user["expiry"] >= date.today()
+    return bool(user["subscribed"]) and user["expiry"] and user["expiry"] >= date.today().isoformat()
 
 
 def get_watchlist(tg_id):
     conn = db()
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT ticker FROM watchlist WHERE telegram_id=%s ORDER BY ticker", (tg_id,)
-            )
-            return [r["ticker"] for r in cur.fetchall()]
+        rows = conn.execute(
+            "SELECT ticker FROM watchlist WHERE telegram_id=? ORDER BY ticker", (tg_id,)
+        ).fetchall()
+        return [r["ticker"] for r in rows]
     finally:
         conn.close()
 
@@ -120,9 +109,7 @@ def get_watchlist(tg_id):
 def ticker_exists(ticker):
     conn = db()
     try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT 1 FROM halal_stocks WHERE ticker=%s", (ticker,))
-            return cur.fetchone() is not None
+        return conn.execute("SELECT 1 FROM halal_stocks WHERE ticker=?", (ticker,)).fetchone() is not None
     finally:
         conn.close()
 
@@ -130,11 +117,8 @@ def ticker_exists(ticker):
 def add_ticker(tg_id, ticker):
     conn = db()
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT IGNORE INTO watchlist (telegram_id, ticker) VALUES (%s,%s)",
-                (tg_id, ticker),
-            )
+        conn.execute("INSERT OR IGNORE INTO watchlist (telegram_id, ticker) VALUES (?,?)", (tg_id, ticker))
+        conn.commit()
     finally:
         conn.close()
 
@@ -142,10 +126,8 @@ def add_ticker(tg_id, ticker):
 def remove_ticker(tg_id, ticker):
     conn = db()
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "DELETE FROM watchlist WHERE telegram_id=%s AND ticker=%s", (tg_id, ticker)
-            )
+        conn.execute("DELETE FROM watchlist WHERE telegram_id=? AND ticker=?", (tg_id, ticker))
+        conn.commit()
     finally:
         conn.close()
 
@@ -153,8 +135,8 @@ def remove_ticker(tg_id, ticker):
 def mark_trial_used(tg_id):
     conn = db()
     try:
-        with conn.cursor() as cur:
-            cur.execute("UPDATE users SET trial_used=TRUE WHERE telegram_id=%s", (tg_id,))
+        conn.execute("UPDATE users SET trial_used=1 WHERE telegram_id=?", (tg_id,))
+        conn.commit()
     finally:
         conn.close()
 
@@ -162,24 +144,24 @@ def mark_trial_used(tg_id):
 def approve_user(tg_id, days=SUB_DAYS):
     conn = db()
     try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT expiry FROM users WHERE telegram_id=%s", (tg_id,))
-            row = cur.fetchone()
-            if not row:
-                return None
-            base = row["expiry"] if row["expiry"] and row["expiry"] >= date.today() else date.today()
-            new_expiry = base + timedelta(days=days)
-            cur.execute(
-                "UPDATE users SET subscribed=TRUE, expiry=%s WHERE telegram_id=%s",
-                (new_expiry, tg_id),
-            )
+        row = conn.execute("SELECT expiry FROM users WHERE telegram_id=?", (tg_id,)).fetchone()
+        if not row:
+            return None
+        today = date.today()
+        base = date.fromisoformat(row["expiry"]) if row["expiry"] and row["expiry"] >= today.isoformat() else today
+        new_expiry = base + timedelta(days=days)
+        conn.execute(
+            "UPDATE users SET subscribed=1, expiry=? WHERE telegram_id=?",
+            (new_expiry.isoformat(), tg_id),
+        )
+        conn.commit()
         return new_expiry
     finally:
         conn.close()
 
 
 def send_trial_report(tg_id):
-    from report import fetch_stock_data, build_report  # local import, avoid circular
+    from report import fetch_stock_data, build_report
 
     tickers = get_watchlist(tg_id)[:TRIAL_TICKER_CAP]
     data = [d for d in (fetch_stock_data(t) for t in tickers) if d]
@@ -230,9 +212,7 @@ def webhook():
     if cmd == "/list":
         conn = db()
         try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT ticker, name FROM halal_stocks ORDER BY ticker")
-                rows = cur.fetchall()
+            rows = conn.execute("SELECT ticker, name FROM halal_stocks ORDER BY ticker").fetchall()
         finally:
             conn.close()
         lines = [f"`{r['ticker'].replace('.CA', '')}` - {r['name']}" for r in rows]
@@ -313,7 +293,6 @@ def webhook():
 
 @app.route("/setwebhook")
 def setwebhook():
-    """Visit this URL once (in browser) after deploy to register the webhook."""
     secret = os.environ.get("WEBHOOK_SECRET", "hook")
     domain = os.environ["WEBHOOK_DOMAIN"]
     url = f"{domain}/{secret}"
@@ -323,7 +302,7 @@ def setwebhook():
 
 @app.route("/run-daily-report")
 def run_daily_report():
-    """Triggered by PythonAnywhere scheduled Task (or GitHub Actions fallback ping)."""
+    """Triggered by an external free cron pinger (e.g. cron-job.org)."""
     token = request.args.get("token")
     if token != os.environ.get("CRON_SECRET"):
         return "forbidden", 403

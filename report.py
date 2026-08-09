@@ -196,32 +196,34 @@ def send_telegram(message: str, chat_id: Optional[str] = None) -> bool:
 
 
 def get_active_subscribers() -> Dict[str, List[str]]:
-    """Return {telegram_id: [tickers]} for users with subscribed=TRUE and expiry not passed."""
-    import pymysql
+    """Return {telegram_id: [tickers]} for users with subscribed=1 and expiry not passed."""
+    import sqlite3
+    from datetime import date as _date
 
-    conn = pymysql.connect(
-        host=os.environ.get("DB_HOST", "localhost"),
-        user=os.environ["DB_USER"],
-        password=os.environ["DB_PASS"],
-        database=os.environ["DB_NAME"],
-        cursorclass=pymysql.cursors.DictCursor,
-    )
+    db_path = os.environ.get("DB_PATH", os.path.join(os.path.dirname(__file__), "egxbot.db"))
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
     watchlists: Dict[str, List[str]] = {}
     try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT telegram_id FROM users WHERE subscribed=TRUE AND expiry >= CURDATE()")
-            ids = [r["telegram_id"] for r in cur.fetchall()]
-            for tg_id in ids:
-                cur.execute("SELECT ticker FROM watchlist WHERE telegram_id=%s", (tg_id,))
-                watchlists[tg_id] = [r["ticker"] for r in cur.fetchall()]
+        today = _date.today().isoformat()
+        ids = [
+            r["telegram_id"]
+            for r in conn.execute(
+                "SELECT telegram_id FROM users WHERE subscribed=1 AND expiry >= ?", (today,)
+            ).fetchall()
+        ]
+        for tg_id in ids:
+            rows = conn.execute("SELECT ticker FROM watchlist WHERE telegram_id=?", (tg_id,)).fetchall()
+            watchlists[tg_id] = [r["ticker"] for r in rows]
     finally:
         conn.close()
     return watchlists
 
 
 def main() -> int:
-    # Legacy/manual mode: no DB env vars set -> broadcast full report to TELEGRAM_CHAT_ID
-    if not os.environ.get("DB_USER"):
+    # Legacy/manual mode: no DB file set up -> broadcast full report to TELEGRAM_CHAT_ID
+    db_path = os.environ.get("DB_PATH", os.path.join(os.path.dirname(__file__), "egxbot.db"))
+    if not os.path.exists(db_path):
         print(f"[INFO] DB not configured — legacy single-chat mode, {len(HALAL_TICKERS)} tickers...")
         all_data = [d for d in (fetch_stock_data(t) for t in HALAL_TICKERS) if d]
         if not all_data:
