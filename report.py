@@ -31,7 +31,7 @@ HALAL_TICKERS = [
 ]
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # fallback single-chat mode (legacy/testing)
 
 
 def calc_rsi(closes: List[float], period: int = 14) -> Optional[float]:
@@ -164,10 +164,11 @@ def build_report(all_data: List[Dict]) -> str:
     return "\n".join(lines)
 
 
-def send_telegram(message: str) -> bool:
+def send_telegram(message: str, chat_id: Optional[str] = None) -> bool:
     """Send message to Telegram via Bot API. Splits into chunks under 4096 chars."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[ERROR] TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set", file=sys.stderr)
+    target = chat_id or TELEGRAM_CHAT_ID
+    if not TELEGRAM_BOT_TOKEN or not target:
+        print("[ERROR] TELEGRAM_BOT_TOKEN or chat_id not set", file=sys.stderr)
         return False
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -176,7 +177,7 @@ def send_telegram(message: str) -> bool:
     ok_all = True
     for chunk in chunks:
         payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
+            "chat_id": target,
             "text": chunk,
             "parse_mode": "Markdown",
         }
@@ -185,43 +186,78 @@ def send_telegram(message: str) -> bool:
             resp.raise_for_status()
             result = resp.json()
             if not result.get("ok"):
-                print(f"[ERROR] Telegram API error: {result}", file=sys.stderr)
+                print(f"[ERROR] Telegram API error for {target}: {result}", file=sys.stderr)
                 ok_all = False
         except requests.RequestException as e:
-            print(f"[ERROR] Failed to send Telegram message: {e}", file=sys.stderr)
+            print(f"[ERROR] Failed to send Telegram message to {target}: {e}", file=sys.stderr)
             ok_all = False
 
-    if ok_all:
-        print("[INFO] Report sent to Telegram successfully")
     return ok_all
 
 
+def get_active_subscribers() -> Dict[str, List[str]]:
+    """Return {telegram_id: [tickers]} for users with subscribed=TRUE and expiry not passed."""
+    import pymysql
+
+    conn = pymysql.connect(
+        host=os.environ.get("DB_HOST", "localhost"),
+        user=os.environ["DB_USER"],
+        password=os.environ["DB_PASS"],
+        database=os.environ["DB_NAME"],
+        cursorclass=pymysql.cursors.DictCursor,
+    )
+    watchlists: Dict[str, List[str]] = {}
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT telegram_id FROM users WHERE subscribed=TRUE AND expiry >= CURDATE()")
+            ids = [r["telegram_id"] for r in cur.fetchall()]
+            for tg_id in ids:
+                cur.execute("SELECT ticker FROM watchlist WHERE telegram_id=%s", (tg_id,))
+                watchlists[tg_id] = [r["ticker"] for r in cur.fetchall()]
+    finally:
+        conn.close()
+    return watchlists
+
+
 def main() -> int:
-    print(f"[INFO] Starting EGX Halal Daily Report for {len(HALAL_TICKERS)} tickers...")
+    # Legacy/manual mode: no DB env vars set -> broadcast full report to TELEGRAM_CHAT_ID
+    if not os.environ.get("DB_USER"):
+        print(f"[INFO] DB not configured — legacy single-chat mode, {len(HALAL_TICKERS)} tickers...")
+        all_data = [d for d in (fetch_stock_data(t) for t in HALAL_TICKERS) if d]
+        if not all_data:
+            print("[ERROR] No data retrieved for any ticker", file=sys.stderr)
+            return 1
+        report = build_report(all_data)
+        return 0 if send_telegram(report) else 1
 
-    all_data = []
-    failed = []
+    # Normal mode: per-subscriber personalized reports
+    print("[INFO] Fetching active subscribers from DB...")
+    watchlists = get_active_subscribers()
+    if not watchlists:
+        print("[INFO] No active subscribers today.")
+        return 0
 
-    for ticker in HALAL_TICKERS:
-        print(f"[INFO] Fetching {ticker}...")
+    all_tickers = sorted({t for lst in watchlists.values() for t in lst})
+    print(f"[INFO] Fetching {len(all_tickers)} unique tickers for {len(watchlists)} subscribers...")
+    cache: Dict[str, Dict] = {}
+    for ticker in all_tickers:
         data = fetch_stock_data(ticker)
         if data:
-            all_data.append(data)
+            cache[ticker] = data
         else:
-            failed.append(ticker)
+            print(f"[WARN] Failed to fetch {ticker}", file=sys.stderr)
 
-    if failed:
-        print(f"[WARN] Failed to fetch data for: {', '.join(failed)}", file=sys.stderr)
+    ok_all = True
+    for tg_id, tickers in watchlists.items():
+        user_data = [cache[t] for t in tickers if t in cache]
+        if not user_data:
+            continue
+        report = build_report(user_data)
+        if not send_telegram(report, chat_id=str(tg_id)):
+            ok_all = False
 
-    if not all_data:
-        print("[ERROR] No data retrieved for any ticker", file=sys.stderr)
-        return 1
-
-    report = build_report(all_data)
-    print("[INFO] Report built, sending to Telegram...")
-
-    success = send_telegram(report)
-    return 0 if success else 1
+    print("[INFO] Daily reports done.")
+    return 0 if ok_all else 1
 
 
 if __name__ == "__main__":
