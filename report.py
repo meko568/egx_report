@@ -37,14 +37,15 @@ def fetch_stock_data(ticker: str) -> Optional[Dict]:
     """
     try:
         stock = yf.Ticker(ticker)
-        hist = stock.history(period="2d", interval="1d")
+        # Use 5d to ensure we get at least 2 trading days (2d often returns only 1 row)
+        hist = stock.history(period="5d", interval="1d")
 
         if hist.empty or len(hist) < 2:
             return None
 
         # Most recent day (today or latest trading day)
         latest = hist.iloc[-1]
-        previous = hist.iloc[-2] if len(hist) > 1 else latest
+        previous = hist.iloc[-2]
 
         current_close = float(latest["Close"])
         prev_close = float(previous["Close"])
