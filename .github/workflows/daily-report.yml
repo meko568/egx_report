@@ -6,7 +6,7 @@ on:
     # Note: Cairo observes DST (EEST, UTC+3) typically Apr-Oct
     # During DST: 8 UTC = 11 AM Cairo. Adjust cron to "0 7 * * *" for DST months if needed.
     - cron: "0 7 * * *"
-  workflow_dispatch:  # Allow manual trigger
+  workflow_dispatch: # Allow manual trigger
 
 jobs:
   daily-report:
@@ -31,10 +31,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install yfinance requests
 
+      - name: Download subscriber DB
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          curl -f "https://meko568.pythonanywhere.com/export-db?token=${CRON_SECRET}" -o egxbot.db
+
       - name: Run daily report script
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DB_PATH: ${{ github.workspace }}/egxbot.db
         run: |
           python report.py
 
