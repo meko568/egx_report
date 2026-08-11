@@ -1,0 +1,51 @@
+name: EGX Job Worker (screen / analyze / trial)
+
+on:
+  schedule:
+    # Every 5 minutes — GitHub's minimum granularity. Actual firing can lag
+    # a few extra minutes under load; that's fine for an "instant" command.
+    - cron: "*/5 * * * *"
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  job-worker:
+    name: Process queued /screen, /analyze, trial jobs
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install yfinance requests
+
+      - name: Download subscriber DB
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          curl -f "https://meko568.pythonanywhere.com/export-db?token=${CRON_SECRET}" -o egxbot.db
+
+      - name: Process job queue
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          WEBHOOK_DOMAIN: https://meko568.pythonanywhere.com
+          DB_PATH: ${{ github.workspace }}/egxbot.db
+        run: |
+          python report.py jobs
+
+      - name: Report completion
+        if: always()
+        run: |
+          echo "Workflow completed at $(date -u)"
