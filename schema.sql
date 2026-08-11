@@ -26,6 +26,19 @@ CREATE TABLE IF NOT EXISTS watchlist (
     FOREIGN KEY (ticker) REFERENCES halal_stocks(ticker) ON DELETE CASCADE
 );
 
+-- On-demand jobs (/screen, /analyze, trial report) queued by bot.py on
+-- PythonAnywhere (which cannot reach Yahoo Finance / Telegram outbound),
+-- and processed by the GitHub Actions job-worker (unrestricted outbound).
+-- A row = pending. The worker deletes rows via /ack-jobs once sent.
+CREATE TABLE IF NOT EXISTS job_queue (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    telegram_id INTEGER,
+    kind        TEXT,      -- 'screen' | 'analyze' | 'trial'
+    payload     TEXT,      -- ticker for 'screen', NULL otherwise
+    lang        TEXT DEFAULT 'en',
+    created_at  TEXT DEFAULT (datetime('now'))
+);
+
 -- Seed halal list (keep in sync with report.py HALAL_TICKERS)
 INSERT OR IGNORE INTO halal_stocks (ticker, name, sector) VALUES
 ('FWRY.CA',   'Fawry',                 'FinTech/Payments'),

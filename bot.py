@@ -8,7 +8,7 @@ Env vars required:
   WEBHOOK_SECRET       - random string, part of the webhook URL path
   WEBHOOK_DOMAIN       - e.g. https://yourname.pythonanywhere.com
   DB_PATH              - e.g. /home/yourname/egx_report/egxbot.db
-  CRON_SECRET          - random string, protects /run-daily-report endpoint
+  CRON_SECRET          - random string, protects /export-db, /ack-jobs, /run-daily-report
   VODAFONE_CASH_NUMBER - number shown to users on /subscribe
 """
 
@@ -85,7 +85,31 @@ def db():
     conn.execute("PRAGMA foreign_keys = ON")
     _ensure_columns(conn)
     _ensure_halal_seed(conn)
+    _ensure_job_queue(conn)
     return conn
+
+
+def _ensure_job_queue(conn):
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS job_queue ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, telegram_id INTEGER, kind TEXT, "
+        "payload TEXT, lang TEXT DEFAULT 'en', created_at TEXT DEFAULT (datetime('now')))"
+    )
+    conn.commit()
+
+
+def enqueue_job(tg_id, kind, payload, lang):
+    """Queue work that needs Yahoo Finance / outbound Telegram — PythonAnywhere
+    free tier can't do either. GitHub Actions job-worker picks these up."""
+    conn = db()
+    try:
+        conn.execute(
+            "INSERT INTO job_queue (telegram_id, kind, payload, lang) VALUES (?, ?, ?, ?)",
+            (tg_id, kind, payload, lang),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _ensure_columns(conn):
@@ -231,7 +255,14 @@ STRINGS = {
         "en": "\U0001F512 /analyze is for subscribers. Use /subscribe to unlock instant + daily reports.",
         "ar": "\U0001F512 /analyze للمشتركين بس. استخدم /subscribe عشان تفتح التقارير الفورية واليومية.",
     },
-    "analyze_wait": {"en": "\u23F3 Crunching your watchlist...", "ar": "\u23F3 بجهز تقريرك..."},
+    "analyze_wait": {
+        "en": "\u23F3 Queued. Your report will arrive in a few minutes.",
+        "ar": "\u23F3 اتضاف للطابور. التقرير هيوصلك خلال دقايق.",
+    },
+    "job_queued": {
+        "en": "\u23F3 Queued — checking {ticker}, result in a few minutes.",
+        "ar": "\u23F3 اتضاف للطابور — بفحص {ticker}، النتيجة هتوصل خلال دقايق.",
+    },
     "search_usage": {"en": "Usage: /search KEYWORD", "ar": "الاستخدام: /search كلمة"},
     "search_none": {"en": "No halal stocks matched \"{kw}\". Try /screen TICKER to check any ticker.", "ar": "مفيش نتايج لـ \"{kw}\". جرب /screen TICKER عشان تفحص أي سهم."},
     "screen_usage": {"en": "Usage: /screen TICKER (e.g. /screen HRHO)", "ar": "الاستخدام: /screen TICKER (مثال: /screen HRHO)"},
@@ -507,18 +538,14 @@ def approve_user(tg_id, days=SUB_DAYS):
 
 
 def send_trial_report(tg_id):
-    from report import fetch_stock_data, build_report
-
+    """PythonAnywhere can't reach Yahoo Finance, so this just queues the job
+    for the GitHub Actions worker (see /ack-jobs, report.py:process_job_queue)."""
     lang = get_lang(tg_id)
     tickers = get_watchlist(tg_id)[:TRIAL_TICKER_CAP]
     if not tickers:
         return
-    data = [d for d in (fetch_stock_data(tk) for tk in tickers) if d]
-    if not data:
-        send_message(tg_id, t("trial_report_fail", lang))
-        return
-    report = build_report(data)
-    send_message(tg_id, t("trial_report_prefix", lang) + report)
+    enqueue_job(tg_id, "trial", None, lang)
+    send_message(tg_id, t("analyze_wait", lang))
     mark_trial_used(tg_id)
 
 
@@ -703,24 +730,9 @@ def webhook():
             return "ok"
         raw = parts[1].upper()
         ticker = raw if raw.endswith(".CA") else raw + ".CA"
-        from report import screen_ticker
-
-        result = screen_ticker(ticker)
-        if not result.get("ok"):
-            send_message(chat_id, t("screen_error", lang, ticker=raw))
-            return "ok"
-        verdict = "\u2705 Passes sector screen" if result["passed"] else f"\u274C Flagged: {result['flag']}"
-        msg = (
-            f"{result['name']} ({raw})\n"
-            f"Sector: {result['sector']}\n"
-            f"Industry: {result['industry']}\n\n"
-            f"{verdict}\n\n"
-            "\u26A0\uFE0F Heuristic sector screen only — not a full Shariah audit "
-            "(debt/interest ratios not checked). Verify manually."
-        )
-        if result["passed"] and chat_id == ADMIN_ID:
-            msg += f"\n\nAdmin: /addstock {raw} <name>"
-        send_message(chat_id, msg)
+        # PythonAnywhere can't reach Yahoo Finance — queue for the GH Actions worker.
+        enqueue_job(chat_id, "screen", ticker, lang)
+        send_message(chat_id, t("job_queued", lang, ticker=raw))
         return "ok"
 
     if cmd == "/addstock":
@@ -809,16 +821,9 @@ def webhook():
         if not tickers:
             send_message(chat_id, t("watchlist_empty", lang))
             return "ok"
+        # PythonAnywhere can't reach Yahoo Finance — queue for the GH Actions worker.
+        enqueue_job(chat_id, "analyze", None, lang)
         send_message(chat_id, t("analyze_wait", lang))
-        from report import fetch_stock_data, build_report
-
-        analyzers = get_user_analyzers(chat_id)
-        data = [d for d in (fetch_stock_data(tk) for tk in tickers) if d]
-        if not data:
-            send_message(chat_id, t("trial_report_fail", lang))
-            return "ok"
-        rpt = build_report(data, analyzers=analyzers)
-        send_message(chat_id, rpt)
         return "ok"
 
     if cmd == "/subscribe":
@@ -855,6 +860,40 @@ def setwebhook():
     url = f"{domain}/{BOT_TOKEN}"
     r = requests.post(f"{API_URL}/setWebhook", json={"url": url}, timeout=10)
     return r.json()
+
+
+@app.route("/export-db")
+def export_db():
+    """Lets GitHub Actions (unrestricted outbound) pull the live subscriber DB,
+    since PythonAnywhere free tier can't reach api.telegram.org / Yahoo Finance
+    to send reports itself."""
+    token = request.args.get("token")
+    if token != os.environ.get("CRON_SECRET"):
+        return "forbidden", 403
+    from flask import send_file
+
+    return send_file(DB_PATH, mimetype="application/octet-stream", as_attachment=True, download_name="egxbot.db")
+
+
+@app.route("/ack-jobs", methods=["POST"])
+def ack_jobs():
+    """GitHub Actions job-worker calls this after sending queued /screen,
+    /analyze, and trial-report results, so processed rows aren't resent."""
+    token = request.args.get("token")
+    if token != os.environ.get("CRON_SECRET"):
+        return "forbidden", 403
+    body = request.get_json(force=True, silent=True) or {}
+    ids = [int(i) for i in body.get("ids", [])]
+    if not ids:
+        return "ok"
+    conn = db()
+    try:
+        qmarks = ",".join("?" * len(ids))
+        conn.execute(f"DELETE FROM job_queue WHERE id IN ({qmarks})", ids)
+        conn.commit()
+    finally:
+        conn.close()
+    return "ok"
 
 
 @app.route("/run-daily-report")

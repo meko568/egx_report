@@ -35,6 +35,22 @@ EXCLUDED_KEYWORDS = [
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # fallback single-chat mode (legacy/testing)
 
+# ─── Job worker (processes /screen, /analyze, trial reports queued by bot.py) ───
+TRIAL_TICKER_CAP = 12
+WEBHOOK_DOMAIN = os.getenv("WEBHOOK_DOMAIN", "https://meko568.pythonanywhere.com")
+CRON_SECRET = os.getenv("CRON_SECRET")
+
+JOB_STRINGS = {
+    "trial_prefix": {"en": "\U0001F381 *One-time free sample report:*\n\n", "ar": "\U0001F381 *تقرير تجريبي مجاني لمرة واحدة:*\n\n"},
+    "fetch_fail": {"en": "\u26A0\uFE0F Couldn't fetch data right now. Try again later.", "ar": "\u26A0\uFE0F معرفتش أجيب البيانات دلوقتي. جرب تاني بعدين."},
+    "screen_error": {"en": "Couldn't fetch data for {ticker}. Check the ticker symbol.", "ar": "معرفتش أجيب بيانات {ticker}. تأكد من الكود."},
+}
+
+
+def _jt(key, lang, **kwargs):
+    s = JOB_STRINGS.get(key, {}).get(lang) or JOB_STRINGS.get(key, {}).get("en", "")
+    return s.format(**kwargs) if kwargs else s
+
 
 # ─── Analyzers ───
 
@@ -321,6 +337,104 @@ def get_active_subscribers() -> Dict[int, Dict]:
     return out
 
 
+def _process_screen_job(tg_id, ticker, lang):
+    result = screen_ticker(ticker)
+    if not result.get("ok"):
+        send_telegram(_jt("screen_error", lang, ticker=ticker.replace(".CA", "")), chat_id=str(tg_id))
+        return
+    verdict = "\u2705 Passes sector screen" if result["passed"] else f"\u274C Flagged: {result['flag']}"
+    msg = (
+        f"{result['name']} ({ticker.replace('.CA', '')})\n"
+        f"Sector: {result['sector']}\n"
+        f"Industry: {result['industry']}\n\n"
+        f"{verdict}\n\n"
+        "\u26A0\uFE0F Heuristic sector screen only — not a full Shariah audit "
+        "(debt/interest ratios not checked). Verify manually."
+    )
+    send_telegram(msg, chat_id=str(tg_id))
+
+
+def _process_analyze_job(conn, tg_id, lang):
+    tickers = [r["ticker"] for r in conn.execute(
+        "SELECT ticker FROM watchlist WHERE telegram_id=?", (tg_id,)
+    ).fetchall()]
+    if not tickers:
+        return
+    row = conn.execute("SELECT analyzers FROM users WHERE telegram_id=?", (tg_id,)).fetchone()
+    analyzers = [a for a in ((row["analyzers"] if row else None) or "rsi").split(",") if a]
+    data = [d for d in (fetch_stock_data(tk) for tk in tickers) if d]
+    if not data:
+        send_telegram(_jt("fetch_fail", lang), chat_id=str(tg_id))
+        return
+    rpt = build_report(data, analyzers=analyzers)
+    send_telegram(rpt, chat_id=str(tg_id))
+
+
+def _process_trial_job(conn, tg_id, lang):
+    tickers = [r["ticker"] for r in conn.execute(
+        "SELECT ticker FROM watchlist WHERE telegram_id=?", (tg_id,)
+    ).fetchall()][:TRIAL_TICKER_CAP]
+    if not tickers:
+        return
+    data = [d for d in (fetch_stock_data(tk) for tk in tickers) if d]
+    if not data:
+        send_telegram(_jt("fetch_fail", lang), chat_id=str(tg_id))
+        return
+    rpt = build_report(data)
+    send_telegram(_jt("trial_prefix", lang) + rpt, chat_id=str(tg_id))
+
+
+def _ack_jobs(ids: List[int]) -> None:
+    if not ids or not CRON_SECRET:
+        return
+    try:
+        r = requests.post(
+            f"{WEBHOOK_DOMAIN}/ack-jobs?token={CRON_SECRET}",
+            json={"ids": ids},
+            timeout=15,
+        )
+        r.raise_for_status()
+    except requests.RequestException as e:
+        print(f"[ERROR] Failed to ack jobs {ids}: {e}", file=sys.stderr)
+
+
+def process_job_queue() -> int:
+    """Process pending /screen, /analyze, and trial-report jobs queued by
+    bot.py on PythonAnywhere (which can't reach Yahoo Finance / Telegram)."""
+    import sqlite3
+
+    db_path = os.environ.get("DB_PATH", os.path.join(os.path.dirname(__file__), "egxbot.db"))
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        jobs = conn.execute("SELECT * FROM job_queue ORDER BY id").fetchall()
+        if not jobs:
+            print("[INFO] No pending jobs.")
+            return 0
+        print(f"[INFO] Processing {len(jobs)} pending job(s)...")
+        processed_ids = []
+        for job in jobs:
+            tg_id, lang, kind = job["telegram_id"], (job["lang"] or "en"), job["kind"]
+            try:
+                if kind == "screen":
+                    _process_screen_job(tg_id, job["payload"], lang)
+                elif kind == "analyze":
+                    _process_analyze_job(conn, tg_id, lang)
+                elif kind == "trial":
+                    _process_trial_job(conn, tg_id, lang)
+                else:
+                    print(f"[WARN] Unknown job kind: {kind}", file=sys.stderr)
+            except Exception as e:
+                print(f"[ERROR] Job {job['id']} ({kind}) failed: {e}", file=sys.stderr)
+            processed_ids.append(job["id"])
+    finally:
+        conn.close()
+
+    _ack_jobs(processed_ids)
+    print(f"[INFO] Job worker done, acked {len(processed_ids)} job(s).")
+    return 0
+
+
 def main() -> int:
     db_path = os.environ.get("DB_PATH", os.path.join(os.path.dirname(__file__), "egxbot.db"))
     if not os.path.exists(db_path):
@@ -372,4 +486,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "jobs":
+        sys.exit(process_job_queue())
     sys.exit(main())
