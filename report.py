@@ -424,9 +424,17 @@ def process_job_queue() -> int:
                     _process_trial_job(conn, tg_id, lang)
                 else:
                     print(f"[WARN] Unknown job kind: {kind}", file=sys.stderr)
+                processed_ids.append(job["id"])
             except Exception as e:
                 print(f"[ERROR] Job {job['id']} ({kind}) failed: {e}", file=sys.stderr)
-            processed_ids.append(job["id"])
+                # Don't silently drop the job - tell the user it failed so
+                # they're not left waiting forever, then ack it so it doesn't
+                # retry-loop forever on the same bad job.
+                try:
+                    send_telegram(_jt("fetch_fail", lang), chat_id=str(tg_id))
+                except Exception as notify_err:
+                    print(f"[ERROR] Also failed to notify user {tg_id}: {notify_err}", file=sys.stderr)
+                processed_ids.append(job["id"])
     finally:
         conn.close()
 
