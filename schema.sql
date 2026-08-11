@@ -15,6 +15,8 @@ CREATE TABLE IF NOT EXISTS users (
     subscribed  INTEGER DEFAULT 0,      -- 0/1
     expiry      TEXT,                   -- ISO date 'YYYY-MM-DD' or NULL
     trial_used  INTEGER DEFAULT 0,      -- 0/1
+    analyze_trial_used INTEGER DEFAULT 0, -- 0/1, one free /analyze for non-subscribers
+    screen_trial_used  INTEGER DEFAULT 0, -- 0/1, one free /screen for non-subscribers
     created_at  TEXT DEFAULT (datetime('now'))
 );
 

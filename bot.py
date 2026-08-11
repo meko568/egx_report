@@ -123,6 +123,8 @@ def _ensure_columns(conn):
         ("analyzers", "TEXT DEFAULT 'rsi'"),
         ("onboarding_step", "TEXT DEFAULT 'done'"),
         ("onboarding_done", "INTEGER DEFAULT 1"),
+        ("analyze_trial_used", "INTEGER DEFAULT 0"),
+        ("screen_trial_used", "INTEGER DEFAULT 0"),
     ]
     changed = False
     for col, ddl in migrations:
@@ -153,8 +155,8 @@ STRINGS = {
             "/remove TICKER - remove a stock\n"
             "/list - all available halal stocks\n"
             "/search KEYWORD - search halal stocks by name/ticker\n"
-            "/screen TICKER - heuristic halal sector screen on any EGX ticker\n"
-            "/analyze - instant report now (subscribers)\n"
+            "/screen TICKER - heuristic halal sector screen (1 free, then subscribers only)\n"
+            "/analyze - instant report now (1 free, then subscribers only)\n"
             "/analyzers - choose which indicators show in your reports\n"
             "/time HH:MM - set your daily report time (default 09:00)\n"
             "/subscribe - get daily reports (100 EGP/month)\n"
@@ -168,8 +170,8 @@ STRINGS = {
             "/remove TICKER - حذف سهم\n"
             "/list - كل الأسهم الحلال المتاحة\n"
             "/search كلمة - بحث في الأسهم الحلال بالاسم أو الكود\n"
-            "/screen TICKER - فحص تقريبي لأي سهم حسب القطاع\n"
-            "/analyze - تقرير فوري دلوقتي (للمشتركين)\n"
+            "/screen TICKER - فحص تقريبي لأي سهم (مرة مجانية، بعدين للمشتركين)\n"
+            "/analyze - تقرير فوري دلوقتي (مرة مجانية، بعدين للمشتركين)\n"
             "/analyzers - اختيار المؤشرات في تقاريرك\n"
             "/time HH:MM - وقت تقريرك اليومي (افتراضي 09:00)\n"
             "/subscribe - اشتراك تقارير يومية (100 جنيه/شهر)\n"
@@ -252,8 +254,12 @@ STRINGS = {
     },
     "analyzers_saved": {"en": "\u2705 Analyzers updated.", "ar": "\u2705 اتحدثت المؤشرات."},
     "analyze_locked": {
-        "en": "\U0001F512 /analyze is for subscribers. Use /subscribe to unlock instant + daily reports.",
-        "ar": "\U0001F512 /analyze للمشتركين بس. استخدم /subscribe عشان تفتح التقارير الفورية واليومية.",
+        "en": "\U0001F512 You've used your free /analyze. Use /subscribe to unlock instant + daily reports.",
+        "ar": "\U0001F512 خلصت الفحص الفوري المجاني بتاعك. استخدم /subscribe عشان تفتح التقارير الفورية واليومية.",
+    },
+    "screen_locked": {
+        "en": "\U0001F512 You've used your free /screen. Use /subscribe for unlimited screens + daily reports.",
+        "ar": "\U0001F512 خلصت الفحص المجاني بتاعك. استخدم /subscribe عشان تفحص بدون حد واحصل على تقارير يومية.",
     },
     "analyze_wait": {
         "en": "\u23F3 Queued. Your report will arrive in a few minutes.",
@@ -518,6 +524,24 @@ def mark_trial_used(tg_id):
         conn.close()
 
 
+def mark_analyze_trial_used(tg_id):
+    conn = db()
+    try:
+        conn.execute("UPDATE users SET analyze_trial_used=1 WHERE telegram_id=?", (tg_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def mark_screen_trial_used(tg_id):
+    conn = db()
+    try:
+        conn.execute("UPDATE users SET screen_trial_used=1 WHERE telegram_id=?", (tg_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def approve_user(tg_id, days=SUB_DAYS):
     conn = db()
     try:
@@ -724,6 +748,10 @@ def webhook():
         return "ok"
 
     if cmd == "/screen":
+        subbed = is_subscribed(user)
+        if not subbed and user["screen_trial_used"]:
+            send_message(chat_id, t("screen_locked", lang))
+            return "ok"
         parts = text.split()
         if len(parts) < 2:
             send_message(chat_id, t("screen_usage", lang))
@@ -733,6 +761,8 @@ def webhook():
         # PythonAnywhere can't reach Yahoo Finance — queue for the GH Actions worker.
         enqueue_job(chat_id, "screen", ticker, lang)
         send_message(chat_id, t("job_queued", lang, ticker=raw))
+        if not subbed:
+            mark_screen_trial_used(chat_id)
         return "ok"
 
     if cmd == "/addstock":
@@ -814,7 +844,8 @@ def webhook():
         return "ok"
 
     if cmd == "/analyze":
-        if not is_subscribed(user):
+        subbed = is_subscribed(user)
+        if not subbed and user["analyze_trial_used"]:
             send_message(chat_id, t("analyze_locked", lang))
             return "ok"
         tickers = get_watchlist(chat_id)
@@ -824,6 +855,8 @@ def webhook():
         # PythonAnywhere can't reach Yahoo Finance — queue for the GH Actions worker.
         enqueue_job(chat_id, "analyze", None, lang)
         send_message(chat_id, t("analyze_wait", lang))
+        if not subbed:
+            mark_analyze_trial_used(chat_id)
         return "ok"
 
     if cmd == "/subscribe":
