@@ -9,12 +9,18 @@ import sys
 import math
 import requests
 import yfinance as yf
-from curl_cffi import requests as cffi_requests
 
 # Yahoo blocks the plain-requests TLS fingerprint that GitHub Actions runners
 # use for the .info/quoteSummary endpoint (silently returns {} instead of
-# raising). A curl_cffi session impersonating a real browser fixes it.
-YF_SESSION = cffi_requests.Session(impersonate="chrome")
+# raising). A curl_cffi session impersonating a real browser fixes it — but
+# only GitHub Actions actually calls Yahoo (PythonAnywhere free tier can't
+# reach it at all), so keep this optional here to avoid crashing PA if it
+# imports report.py without curl_cffi installed.
+try:
+    from curl_cffi import requests as cffi_requests
+    YF_SESSION = cffi_requests.Session(impersonate="chrome")
+except ImportError:
+    YF_SESSION = None
 from datetime import datetime
 from typing import Dict, List, Optional
 
