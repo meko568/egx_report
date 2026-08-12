@@ -29,8 +29,14 @@ import sys
 import time
 import requests
 import yfinance as yf
+from curl_cffi import requests as cffi_requests
 
 RATIO_CUTOFF = 0.33  # AAOIFI-style debt/cash screen threshold
+
+# Yahoo blocks the plain-requests TLS fingerprint that GitHub Actions runners
+# use for the .info/quoteSummary endpoint (silently returns {} instead of
+# raising). A curl_cffi session impersonating a real browser fixes it.
+YF_SESSION = cffi_requests.Session(impersonate="chrome")
 
 # sector/industry substrings (lowercase) that disqualify a ticker outright,
 # regardless of financial ratios. Kept in sync with report.py EXCLUDED_KEYWORDS.
@@ -97,10 +103,18 @@ def screen_all():
     passed, rejected, review = [], [], []
     for sym in EGX_ALL_TICKERS:
         ticker = f"{sym}.CA"
-        try:
-            info = yf.Ticker(ticker).info
-        except Exception as e:
-            review.append((ticker, f"fetch error: {e}"))
+        info = None
+        for attempt in range(3):
+            try:
+                info = yf.Ticker(ticker, session=YF_SESSION).info
+                if info and (info.get("sector") or info.get("industry")):
+                    break
+            except Exception as e:
+                info = None
+            time.sleep(1.5 * (attempt + 1))  # backoff on empty/error before retry
+
+        if not info:
+            review.append((ticker, "fetch failed after 3 retries (empty response)"))
             continue
 
         if not info or not (info.get("sector") or info.get("industry")):

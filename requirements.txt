@@ -1,3 +1,4 @@
 flask
 requests
 yfinance
+curl_cffi

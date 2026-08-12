@@ -9,6 +9,12 @@ import sys
 import math
 import requests
 import yfinance as yf
+from curl_cffi import requests as cffi_requests
+
+# Yahoo blocks the plain-requests TLS fingerprint that GitHub Actions runners
+# use for the .info/quoteSummary endpoint (silently returns {} instead of
+# raising). A curl_cffi session impersonating a real browser fixes it.
+YF_SESSION = cffi_requests.Session(impersonate="chrome")
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -143,7 +149,7 @@ def screen_ticker(ticker: str) -> Dict:
     """Heuristic halal screen based on sector/industry keywords.
     NOT a full Shariah audit (no debt-ratio / interest-income check)."""
     try:
-        info = yf.Ticker(ticker).info
+        info = yf.Ticker(ticker, session=YF_SESSION).info
     except Exception as e:
         return {"ok": False, "error": str(e)}
     if not info or not (info.get("sector") or info.get("industry")):
@@ -168,7 +174,7 @@ def fetch_stock_data(ticker: str) -> Optional[Dict]:
     Returns None if data unavailable.
     """
     try:
-        stock = yf.Ticker(ticker)
+        stock = yf.Ticker(ticker, session=YF_SESSION)
         hist = stock.history(period="6mo", interval="1d")  # 6mo so SMA50/MACD have data
 
         if hist.empty or len(hist) < 2:
