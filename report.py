@@ -6,6 +6,7 @@ Fetches halal-compliant EGX stock data from Yahoo Finance and sends to Telegram.
 
 import os
 import sys
+import math
 import requests
 import yfinance as yf
 from datetime import datetime
@@ -117,11 +118,12 @@ def calc_bollinger(closes: List[float]) -> str:
 
 
 def calc_volume_spike(volumes: List[float]) -> str:
-    if len(volumes) < 21:
+    clean = [v for v in volumes if v is not None and not math.isnan(v)]
+    if len(clean) < 21:
         return "N/A"
-    avg20 = sum(volumes[-21:-1]) / 20
-    today = volumes[-1]
-    if avg20 == 0:
+    avg20 = sum(clean[-21:-1]) / 20
+    today = clean[-1]
+    if not avg20:
         return "N/A"
     ratio = today / avg20
     flag = "\u26A0\uFE0F spike" if ratio >= 2 else ("elevated" if ratio >= 1.5 else "normal")
@@ -174,12 +176,32 @@ def fetch_stock_data(ticker: str) -> Optional[Dict]:
 
         closes = hist["Close"].tolist()
         volumes = hist["Volume"].tolist()
-        current_close = float(closes[-1])
-        prev_close = float(closes[-2])
-        volume = int(volumes[-1])
 
-        pct_change = ((current_close - prev_close) / prev_close) * 100 if prev_close != 0 else 0.0
-        rsi = calc_rsi(closes)
+        # walk back from the end to skip trailing NaN rows (Yahoo sometimes
+        # returns a stale/partial last row for EGX tickers)
+        current_close = None
+        for c in reversed(closes):
+            if c is not None and not math.isnan(c):
+                current_close = float(c)
+                break
+        if current_close is None:
+            return None
+
+        prev_close = None
+        for c in reversed(closes[:-1]):
+            if c is not None and not math.isnan(c):
+                prev_close = float(c)
+                break
+
+        raw_vol = volumes[-1] if volumes else None
+        volume = int(raw_vol) if raw_vol is not None and not math.isnan(raw_vol) else None
+
+        pct_change = (
+            ((current_close - prev_close) / prev_close) * 100
+            if prev_close and prev_close != 0
+            else None
+        )
+        rsi = calc_rsi([c for c in closes if c is not None and not math.isnan(c)])
 
         info = {}
         try:
@@ -198,7 +220,12 @@ def fetch_stock_data(ticker: str) -> Optional[Dict]:
         fwd_pe = info.get("forwardPE") or info.get("trailingPE")
         pe_str = f"{fwd_pe:.1f}" if fwd_pe else "N/A"
 
-        target = info.get("targetMeanPrice")
+        target = (
+            info.get("targetMeanPrice")
+            or info.get("targetMedianPrice")
+            or info.get("targetHighPrice")
+            or info.get("targetLowPrice")
+        )
         target_str = f"{target:.2f}" if target else "N/A"
 
         return {
@@ -222,10 +249,10 @@ def fetch_stock_data(ticker: str) -> Optional[Dict]:
 def format_line(d: Dict, prefix: str = "", analyzers: Optional[List[str]] = None) -> str:
     ticker = d["ticker"].replace(".CA", "")
     price = f"{d['price']:.2f}"
-    change = f"{d['change_pct']:+.2f}%"
-    vol = f"{d['volume']:,}" if d.get("volume") else "N/A"
+    change = f"{d['change_pct']:+.2f}%" if d.get("change_pct") is not None else "N/A"
+    vol = f"{d['volume']:,}" if d.get("volume") is not None else "N/A"
     rsi = f"{d['rsi']}" if d.get("rsi") is not None else "N/A"
-    emoji = "\U0001F7E2" if d["change_pct"] >= 0 else "\U0001F534"
+    emoji = "\U0001F7E2" if (d.get("change_pct") or 0) >= 0 else "\U0001F534"
     lines = [
         f"{prefix}{emoji} `{ticker}`: {price} EGP ({change})",
         f"    Vol: {vol} | RSI: {rsi} | {d.get('range_str', 'N/A')}",
@@ -252,8 +279,8 @@ def build_report(all_data: List[Dict], analyzers: Optional[List[str]] = None) ->
     for d in all_data:
         lines.append(format_line(d, analyzers=analyzers))
 
-    sorted_data = sorted(all_data, key=lambda x: x["change_pct"], reverse=True)
-    gainers = [d for d in sorted_data if d["change_pct"] > 0][:3]
+    sorted_data = sorted(all_data, key=lambda x: (x["change_pct"] is not None, x["change_pct"]), reverse=True)
+    gainers = [d for d in sorted_data if (d["change_pct"] or 0) > 0][:3]
 
     lines.extend(["", "\U0001F4C8 *Top Gainers*"])
     if gainers:
@@ -262,7 +289,7 @@ def build_report(all_data: List[Dict], analyzers: Optional[List[str]] = None) ->
     else:
         lines.append("No gainers today.")
 
-    losers = [d for d in sorted_data if d["change_pct"] < 0][-3:]
+    losers = [d for d in sorted_data if (d["change_pct"] or 0) < 0][-3:]
     losers.reverse()
 
     lines.extend(["", "\U0001F4C9 *Top Losers*"])
