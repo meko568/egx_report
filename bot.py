@@ -33,6 +33,7 @@ SUB_PRICE_EGP = 100
 SUB_DAYS = 30
 TRIAL_TICKER_CAP = 12
 TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+STOCK_PAGE_SIZE = 12
 
 app = Flask(__name__)
 
@@ -232,8 +233,12 @@ STRINGS = {
     # onboarding
     "choose_language": {"en": "\U0001F44B Welcome! Choose your language:", "ar": "\U0001F44B اهلاً! اختار لغتك:"},
     "choose_stocks": {
-        "en": "Pick the halal stocks you want to track (tap to toggle), then tap Done:",
-        "ar": "اختار الأسهم الحلال اللي عايز تتابعها (دوس عشان تختار)، وبعدين دوس تم:",
+        "en": "Pick the halal stocks you want to track (tap to toggle). Too many to scroll? Send /search KEYWORD (name, ticker, or sector) to filter, then tap Done:",
+        "ar": "اختار الأسهم الحلال اللي عايز تتابعها (دوس عشان تختار). كتير قوي وبتدور؟ ابعت /search كلمة (اسم أو رمز أو قطاع) عشان تفلتر، وبعدين دوس تم:",
+    },
+    "search_results": {
+        "en": "Results for \"{kw}\" (tap to toggle):",
+        "ar": "نتايج \"{kw}\" (دوس عشان تختار):",
     },
     "done_btn": {"en": "Done", "ar": "تم"},
     "stocks_need_one": {"en": "Pick at least one stock first.", "ar": "اختار سهم واحد على الأقل الأول."},
@@ -417,28 +422,51 @@ def build_lang_markup():
     ]]}
 
 
-def build_stock_markup(tg_id):
-    conn = db()
-    try:
-        rows = conn.execute("SELECT ticker FROM halal_stocks ORDER BY ticker").fetchall()
-    finally:
-        conn.close()
+def build_stock_markup(tg_id, rows=None, page=0, ctx=None):
+    if rows is None:
+        conn = db()
+        try:
+            rows = conn.execute("SELECT ticker FROM halal_stocks ORDER BY ticker").fetchall()
+        finally:
+            conn.close()
+        paged = True
+        ctx = f"p{page}"
+    else:
+        paged = False
+        ctx = ctx or "p0"
+
     wl = set(get_watchlist(tg_id))
+    total = len(rows)
+    page_rows = rows
+    if paged:
+        start = page * STOCK_PAGE_SIZE
+        page_rows = rows[start:start + STOCK_PAGE_SIZE]
+
     buttons, row = [], []
-    for r in rows:
+    for r in page_rows:
         tk = r["ticker"]
         label = ("\u2705 " if tk in wl else "") + tk.replace(".CA", "")
-        row.append({"text": label, "callback_data": f"stock:TOGGLE:{tk}"})
+        row.append({"text": label, "callback_data": f"stock:TOGGLE:{ctx}:{tk}"})
         if len(row) == 3:
             buttons.append(row)
             row = []
     if row:
         buttons.append(row)
+
+    if paged and total > STOCK_PAGE_SIZE:
+        nav = []
+        if page > 0:
+            nav.append({"text": "\u25C0 Prev", "callback_data": f"stock:PAGE:{page-1}"})
+        nav.append({"text": f"{page+1}/{-(-total // STOCK_PAGE_SIZE)}", "callback_data": "stock:NOOP"})
+        if start + STOCK_PAGE_SIZE < total:
+            nav.append({"text": "Next \u25B6", "callback_data": f"stock:PAGE:{page+1}"})
+        buttons.append(nav)
+
     return buttons  # done button appended by caller with correct lang
 
 
-def build_stock_keyboard(tg_id, lang):
-    buttons = build_stock_markup(tg_id)
+def build_stock_keyboard(tg_id, lang, rows=None, page=0, ctx=None):
+    buttons = build_stock_markup(tg_id, rows=rows, page=page, ctx=ctx)
     buttons.append([{"text": "\u2705 " + t("done_btn", lang), "callback_data": "stock:DONE"}])
     return {"inline_keyboard": buttons}
 
@@ -612,14 +640,33 @@ def handle_callback(cq):
 
     if prefix == "stock":
         action = parts[1]
-        if action == "TOGGLE":
-            ticker = parts[2]
+        if action == "NOOP":
+            return
+        if action == "PAGE":
+            page = int(parts[2])
+            edit_markup(chat_id, message_id, build_stock_keyboard(chat_id, lang, page=page))
+        elif action == "TOGGLE":
+            ctx, ticker = parts[2], parts[3]
             wl = get_watchlist(chat_id)
             if ticker in wl:
                 remove_ticker(chat_id, ticker)
             else:
                 add_ticker(chat_id, ticker)
-            edit_markup(chat_id, message_id, build_stock_keyboard(chat_id, lang))
+            if ctx.startswith("s"):
+                kw = ctx[1:]
+                conn = db()
+                try:
+                    rows = conn.execute(
+                        "SELECT ticker FROM halal_stocks "
+                        "WHERE ticker LIKE ? OR name LIKE ? OR sector LIKE ? ORDER BY ticker",
+                        (f"%{kw}%", f"%{kw}%", f"%{kw}%"),
+                    ).fetchall()
+                finally:
+                    conn.close()
+                edit_markup(chat_id, message_id, build_stock_keyboard(chat_id, lang, rows=rows, ctx=ctx))
+            else:
+                page = int(ctx[1:]) if len(ctx) > 1 else 0
+                edit_markup(chat_id, message_id, build_stock_keyboard(chat_id, lang, page=page))
         elif action == "DONE":
             if not get_watchlist(chat_id):
                 answer_callback(cq_id, t("stocks_need_one", lang), alert=True)
@@ -743,8 +790,12 @@ def webhook():
         if not rows:
             send_message(chat_id, t("search_none", lang, kw=kw))
             return "ok"
-        lines = [f"`{r['ticker'].replace('.CA', '')}` - {r['name']} ({r['sector']})" for r in rows]
-        send_message(chat_id, t("list_header", lang) + "\n" + "\n".join(lines))
+        ctx_kw = re.sub(r"[:\s]", "", kw)[:20]
+        send_message(
+            chat_id,
+            t("search_results", lang, kw=kw),
+            reply_markup=build_stock_keyboard(chat_id, lang, rows=rows, ctx=f"s{ctx_kw}"),
+        )
         return "ok"
 
     if cmd == "/screen":
@@ -927,6 +978,32 @@ def ack_jobs():
     finally:
         conn.close()
     return "ok"
+
+
+@app.route("/import-halal-list", methods=["POST"])
+def import_halal_list():
+    """Called by build_halal_universe.py (GitHub Actions, monthly) after it
+    screens the full EGX ticker universe (sector exclusions + debt/cash
+    ratio check). Replaces halal_stocks wholesale. Tickers dropped from the
+    new list cascade-delete out of user watchlists (schema.sql FK)."""
+    token = request.args.get("token")
+    if token != os.environ.get("CRON_SECRET"):
+        return "forbidden", 403
+    body = request.get_json(force=True, silent=True) or {}
+    stocks = body.get("stocks", [])
+    if not stocks:
+        return "no stocks in payload", 400
+    conn = db()
+    try:
+        conn.execute("DELETE FROM halal_stocks")
+        conn.executemany(
+            "INSERT OR REPLACE INTO halal_stocks (ticker, name, sector) VALUES (?, ?, ?)",
+            [(s["ticker"], s.get("name", s["ticker"]), s.get("sector", "")) for s in stocks],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return {"imported": len(stocks)}
 
 
 @app.route("/run-daily-report")
