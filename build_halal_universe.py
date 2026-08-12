@@ -29,14 +29,15 @@ import sys
 import time
 import requests
 import yfinance as yf
-from curl_cffi import requests as cffi_requests
 
 RATIO_CUTOFF = 0.33  # AAOIFI-style debt/cash screen threshold
 
 # Yahoo blocks the plain-requests TLS fingerprint that GitHub Actions runners
-# use for the .info/quoteSummary endpoint (silently returns {} instead of
-# raising). A curl_cffi session impersonating a real browser fixes it.
-YF_SESSION = cffi_requests.Session(impersonate="chrome")
+# use for the .info/quoteSummary endpoint. Recent yfinance (0.2.6x+) handles
+# curl_cffi impersonation INTERNALLY now and manages its own cookie/crumb
+# session — passing a hand-built curl_cffi Session actively breaks that flow.
+# Fix is just having curl_cffi installed (see requirements.txt / workflow
+# pip install step); don't construct or pass a session, let yfinance own it.
 
 # sector/industry substrings (lowercase) that disqualify a ticker outright,
 # regardless of financial ratios. Kept in sync with report.py EXCLUDED_KEYWORDS.
@@ -109,7 +110,7 @@ def screen_all():
         info = None
         for attempt in range(2):  # 2 tries max: retries were blowing the 40min budget at 3
             try:
-                info = yf.Ticker(ticker, session=YF_SESSION).info
+                info = yf.Ticker(ticker).info
                 if info and (info.get("sector") or info.get("industry")):
                     break
             except Exception as e:

@@ -11,16 +11,12 @@ import requests
 import yfinance as yf
 
 # Yahoo blocks the plain-requests TLS fingerprint that GitHub Actions runners
-# use for the .info/quoteSummary endpoint (silently returns {} instead of
-# raising). A curl_cffi session impersonating a real browser fixes it — but
-# only GitHub Actions actually calls Yahoo (PythonAnywhere free tier can't
-# reach it at all), so keep this optional here to avoid crashing PA if it
-# imports report.py without curl_cffi installed.
-try:
-    from curl_cffi import requests as cffi_requests
-    YF_SESSION = cffi_requests.Session(impersonate="chrome")
-except ImportError:
-    YF_SESSION = None
+# use for the .info/quoteSummary endpoint. Recent yfinance (0.2.6x+) handles
+# curl_cffi impersonation INTERNALLY now and manages its own cookie/crumb
+# session — passing a hand-built curl_cffi Session actively breaks that flow
+# (yfinance either rejects it or the cookie handshake silently fails,
+# returning {}). Fix is just having curl_cffi installed; don't construct or
+# pass a session at all, let yfinance own it.
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -155,7 +151,7 @@ def screen_ticker(ticker: str) -> Dict:
     """Heuristic halal screen based on sector/industry keywords.
     NOT a full Shariah audit (no debt-ratio / interest-income check)."""
     try:
-        info = yf.Ticker(ticker, session=YF_SESSION).info
+        info = yf.Ticker(ticker).info
     except Exception as e:
         return {"ok": False, "error": str(e)}
     if not info or not (info.get("sector") or info.get("industry")):
@@ -180,7 +176,7 @@ def fetch_stock_data(ticker: str) -> Optional[Dict]:
     Returns None if data unavailable.
     """
     try:
-        stock = yf.Ticker(ticker, session=YF_SESSION)
+        stock = yf.Ticker(ticker)
         hist = stock.history(period="6mo", interval="1d")  # 6mo so SMA50/MACD have data
 
         if hist.empty or len(hist) < 2:
