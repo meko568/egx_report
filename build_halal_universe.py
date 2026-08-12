@@ -101,20 +101,23 @@ def ratio_screen(info):
 
 def screen_all():
     passed, rejected, review = [], [], []
-    for sym in EGX_ALL_TICKERS:
+    total = len(EGX_ALL_TICKERS)
+    for idx, sym in enumerate(EGX_ALL_TICKERS, 1):
         ticker = f"{sym}.CA"
+        if idx % 10 == 0 or idx == total:
+            print(f"[PROGRESS] {idx}/{total} — {len(passed)} passed so far", flush=True)
         info = None
-        for attempt in range(3):
+        for attempt in range(2):  # 2 tries max: retries were blowing the 40min budget at 3
             try:
                 info = yf.Ticker(ticker, session=YF_SESSION).info
                 if info and (info.get("sector") or info.get("industry")):
                     break
             except Exception as e:
                 info = None
-            time.sleep(1.5 * (attempt + 1))  # backoff on empty/error before retry
+            time.sleep(1.0 * (attempt + 1))  # backoff on empty/error before retry
 
         if not info:
-            review.append((ticker, "fetch failed after 3 retries (empty response)"))
+            review.append((ticker, "fetch failed after 2 retries (empty response)"))
             continue
 
         if not info or not (info.get("sector") or info.get("industry")):
