@@ -11,7 +11,7 @@ jobs:
   rebuild-halal-universe:
     name: Screen full EGX universe and import halal list
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 40
 
     permissions:
       contents: read
@@ -28,7 +28,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install yfinance requests
+          pip install --upgrade yfinance requests curl_cffi
 
       - name: Screen EGX universe and import into live DB
         env:
