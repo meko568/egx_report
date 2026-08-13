@@ -115,6 +115,7 @@ def screen_all():
                     break
             except Exception as e:
                 info = None
+                print(f"[DEBUG] {ticker} attempt {attempt+1} exception: {type(e).__name__}: {e}", flush=True)
             time.sleep(1.0 * (attempt + 1))  # backoff on empty/error before retry
 
         if not info:
