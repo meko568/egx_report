@@ -111,6 +111,8 @@ def screen_all():
         for attempt in range(2):  # 2 tries max: retries were blowing the 40min budget at 3
             try:
                 info = yf.Ticker(ticker).info
+                if idx == 1:
+                    print(f"[DEBUG] {ticker} raw info keys: {sorted(info.keys()) if info else info}", flush=True)
                 if info and (info.get("sector") or info.get("industry")):
                     break
             except Exception as e:
